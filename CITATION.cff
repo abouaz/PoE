@@ -1,0 +1,24 @@
+cff-version: 1.2.0
+title: "Portfolio of Experts (PoE)"
+message: "If you use this software, please cite it as below."
+type: software
+authors:
+  - given-names: Avigdor
+    family-names: Bouaziz
+  - given-names: Zhangyue
+    family-names: Yin
+abstract: >-
+  A routing method for Mixture-of-Experts language models that applies Modern
+  Portfolio Theory to expert selection. PoE augments ReLU-based routing with a
+  covariance penalty on expert returns, discouraging the router from
+  co-activating experts whose contributions are redundant, so the model reaches
+  comparable quality while activating fewer experts per token. Avigdor Bouaziz
+  and Zhangyue Yin contributed equally.
+keywords:
+  - mixture-of-experts
+  - expert routing
+  - modern portfolio theory
+  - language-models
+  - sparse-models
+repository-code: "https://github.com/abouaz/PoE"
+license-url: "https://github.com/abouaz/PoE"

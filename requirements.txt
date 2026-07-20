@@ -1,0 +1,22 @@
+# Core — training and model
+# NOTE: torch is pinned by version only; the environment used torch 2.10.0+cu128.
+# Install the build matching YOUR CUDA/CPU setup from https://pytorch.org, then
+# the rest of this file. On CPU-only machines (e.g. for the smoke test), a CPU
+# torch build is sufficient.
+torch==2.10.0
+transformers==5.3.0
+tokenizers==0.22.2
+safetensors==0.7.0
+
+# Data
+datasets==4.7.0
+
+# Numerics — covariance estimation, Ledoit-Wolf shrinkage
+numpy==2.4.3
+scipy==1.17.1
+scikit-learn==1.8.0
+einops==0.8.2
+
+# Logging / utilities
+wandb==0.25.1
+tqdm==4.67.3
