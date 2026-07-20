@@ -1,0 +1,741 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+Portfolio of Experts (PoE) — PoE_4 framework.
+
+This file implements the framework described in "Portfolio of Experts"
+(Yin, Deng, Bouaziz, Wang — UCL Centre for Artificial Intelligence, PoE_4.pdf).
+
+KEY DIFFERENCE FROM THE EARLIER DESIGN (model_poe.py / model_poe_overused.py)
+----------------------------------------------------------------------------
+The earlier files modified the *routing forward pass*: they subtracted a
+variance + correlation penalty from the gate logits before the ReLU, and they
+maintained a running activation-frequency proxy `q_hat`. PoE_4 abandons that
+design. Here:
+
+  • The routing forward pass is PLAIN ReLU routing (Eq. 14):  R(x)_i = ReLU((Wx)_i)
+    -> no portfolio machinery in the forward pass, no q_hat, no circular
+      dependency between routing weights and the penalty.
+
+  • The portfolio mechanism enters ONLY as an auxiliary loss (Eq. 16):
+        L_div = (b / (L T)) Σ_l Σ_m Σ_{i≠j} R(x_m)_i R(x_m)_j  Σ̂^l_ij
+    The covariance Σ̂_ij is treated as a constant in the backward pass, so the
+    gradient of L_div flows only into the routing weights R, hence into the
+    gate W. There is no variance penalty (only the off-diagonal covariance).
+
+  • The covariance is the CO-ACTIVATION-CONDITIONED return covariance (Eq. 9),
+    estimated only over tokens where BOTH experts are active, with a running
+    EMA across steps (Eq. 10), then stabilised by Ledoit-Wolf shrinkage toward
+    an uncorrelated (zero off-diagonal) target (Eq. 13).
+
+EQUATIONS IMPLEMENTED
+---------------------
+  Eq.  4  Expert return (per token):  r_i(x_m) = -<E_i(x_m), ∂L/∂y_m>
+  Eq.  9  Co-activation covariance:   c_ij = mean_{m∈A_ij} (r_i-μ̂_i)(r_j-μ̂_j)
+  Eq. 10  Covariance EMA:             Ĉ_ij <- (1-β) Ĉ_ij + β c_ij
+  Eq. 13  Shrinkage:                  Σ̂_ij = (1-γ) Ĉ_ij      (i≠j)
+  Eq. 14  Routing forward pass:       R(x)_i = ReLU((Wx)_i)
+  Eq. 15  Layer output:               y = Σ_i R(x)_i E_i(x) + shared
+  Eq. 16  Portfolio penalty (loss):   L_div  (see above)
+  Eq. 18  L1 sparsity regulariser:    (1/T) Σ_t Σ_i R(x_t)_i
+  Eq. 19  Adaptive λ controller:      λ <- λ · η^{ sign((1-k/N) - S) }
+  Eq. 20  Load-balanced regulariser:  (λ/T) Σ_t Σ_i f_i R(x_t)_i
+
+ABLATION AXES (Section 3)
+-------------------------
+cov_estimator selects how Σ̂ is built (the primary ablation axis):
+  "coactivation"      Eq. 9 co-activation-conditioned return covariance (default)
+  "batchmean"         per-step batch-mean return cross-products (the between-step
+                      confound baseline criticised in Section 2.3 / Appendix B)
+  "routing_weighted"  return covariance weighted by routing weights p_i p_j
+  "set_overlap"       gradient-agnostic Jaccard overlap of co-activation sets
+  "output_similarity" gradient-agnostic <E_i, E_j> output similarity (Guo et al.;
+                      Remark 2 special case)
+
+shrinkage_mode selects the Ledoit-Wolf intensity schedule (second ablation axis):
+  "ledoit_wolf"  adaptive intensity from estimator noise vs signal (default)
+  "schedule"     deterministic cold-start: γ = 1 early, decays to γ_min
+  "constant"     fixed γ = shrinkage_gamma
+  "none"         γ = 0 (no shrinkage)
+
+TRAINING LOOP INTEGRATION (see train.py --mode poe)
+---------------------------------------------------
+  model.reset_poe_stats()                  # before each forward
+  out = model(input_ids, labels)           # plain ReLU routing forward
+  l1, div, active = model.collect_poe_stats()
+  total = out.loss + lambda_poe*mean(l1) + mean(div)   # div already carries b
+  total.backward()
+  model.update_portfolio_stats()           # AFTER backward: builds Σ̂ for next step
+  # once per optimizer step: adapt lambda_poe (Eq. 19) and anneal b via set_b()
+"""
+from __future__ import annotations
+
+import warnings
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+# Reuse all architecture building blocks from model.py.
+from model import (
+    MoEModelOutput,
+    RMSNorm,
+    Attention,
+    SwiGLU,
+    count_params,  # noqa: F401  (re-exported for convenience)
+)
+
+
+# ============================================================================ #
+#  Configuration                                                                #
+# ============================================================================ #
+
+@dataclass
+class PoEConfig:
+    """Drop-in config for the PoE_4 model. Architecture fields mirror MoEConfig."""
+
+    # ── Architecture (mirrors MoEConfig) ────────────────────────────────────
+    vocab_size: int = 50304
+    hidden_size: int = 1024
+    num_hidden_layers: int = 32
+    num_attention_heads: int = 16
+    num_key_value_heads: int = 8
+    head_dim: int = 128
+    max_position_embeddings: int = 2048
+    rope_theta: float = 500000.0
+    rms_norm_eps: float = 1e-6
+    initializer_range: float = 0.02
+    tie_word_embeddings: bool = False
+    routing_mode: str = "poe"  # informational only
+
+    # ── MoE structure (mirrors MoEConfig) ───────────────────────────────────
+    num_routed_experts: int = 8       # N
+    num_shared_experts: int = 1
+    num_experts_per_tok: int = 2      # k (target active routed experts/token)
+    moe_intermediate_size: int = 2048
+
+    # ── Portfolio penalty (Eq. 16) ───────────────────────────────────────────
+    b_target: float = 0.01
+    # Risk aversion b. b=0 recovers plain ReLU routing (Proposition 3). Annealed
+    # 0 -> b_target by the training loop (set_b). Kept small because L_div scales
+    # with squared routing weights times return covariance.
+
+    # ── Return / covariance estimation (Eq. 9, 10) ───────────────────────────
+    mu_ema: float = 0.01
+    # EMA smoothing for the running mean return μ̂ used to centre returns.
+    beta_cov: float = 0.05
+    # EMA smoothing β for the running covariance Ĉ (Eq. 10).
+    min_coact: int = 1
+    # Minimum co-activation count |A_ij| in a step before that pair's Ĉ entry is
+    # updated. Pairs below this are frozen for the step (Eq. 9 "skip if empty").
+    return_scale: str = "none"
+    # "none"  : use raw returns r_i = -<E_i, dL/dy>.
+    # "rms"   : divide returns by a running RMS so the covariance is scale-free
+    #           across layers/training (helps choose a single b). Recommended.
+    return_rms_ema: float = 0.01
+
+    cov_estimator: str = "coactivation"
+    # Primary ablation axis (Section 3). One of:
+    #   coactivation | batchmean | routing_weighted | set_overlap | output_similarity
+
+    # ── Shrinkage (Eq. 13) ───────────────────────────────────────────────────
+    shrinkage_mode: str = "ledoit_wolf"
+    # ledoit_wolf | schedule | constant | none
+    shrinkage_gamma: float = 0.5     # γ for shrinkage_mode="constant"
+    shrinkage_gamma_min: float = 0.0  # floor for ledoit_wolf / schedule
+    shrinkage_gamma_max: float = 1.0  # cap for ledoit_wolf
+    shrinkage_warmup_steps: int = 2000
+    # For shrinkage_mode="schedule": γ ramps from 1 (full shrink, cold start)
+    # down to gamma_min linearly over this many calls to update_portfolio_stats.
+    shrinkage_noise_ema: float = 0.05
+    # EMA smoothing for the per-step noise estimate used by ledoit_wolf.
+
+    # ── Sparsity / load balancing (Eq. 18-20) ────────────────────────────────
+    use_load_balancing: bool = True
+    # If True, the L1 regulariser is weighted by per-expert load (Eq. 20).
+    # If False, it is the plain L1 of Eq. 18.
+
+    # ── Penalty sign (boundedness guarantee) ─────────────────────────────────
+    penalty_sign: str = "redundancy_only"
+    # "redundancy_only": clamp Σ̂_ij ≥ 0 so L_div ≥ 0. Only positive covariance
+    #     (redundancy) is penalised; anti-correlated pairs are left alone.
+    #     Guarantees L_div is bounded below (Σ̂ entrywise ≥ 0, s ≥ 0 → sᵀΣ̂s ≥ 0).
+    # "signed": keep the full signed Σ̂ including negative entries. Negative
+    #     off-diagonals reward anti-correlated expert pairs, which creates an
+    #     unbounded downward direction (sᵀΣ̂s → −∞ as s → ∞ along the negative
+    #     eigenvector). Safe only when b is small and L1 is strong enough to
+    #     prevent routing weight explosion. Use as an ablation only.
+
+    eps: float = 1e-8  # numerical floor for denominators
+
+    def __post_init__(self):
+        assert self.num_attention_heads % self.num_key_value_heads == 0
+        assert 0.0 < self.mu_ema < 1.0
+        assert 0.0 < self.beta_cov < 1.0
+        assert self.cov_estimator in (
+            "coactivation", "batchmean", "routing_weighted",
+            "set_overlap", "output_similarity",
+        ), f"unknown cov_estimator: {self.cov_estimator}"
+        assert self.shrinkage_mode in (
+            "ledoit_wolf", "schedule", "constant", "none",
+        ), f"unknown shrinkage_mode: {self.shrinkage_mode}"
+        assert self.return_scale in ("none", "rms")
+        assert self.penalty_sign in ("redundancy_only", "signed"), \
+            f"unknown penalty_sign: {self.penalty_sign}"
+
+
+# ============================================================================ #
+#  Adaptive L1 controller (Eq. 19)                                              #
+# ============================================================================ #
+
+def poe_lambda_step(
+    lambda_val: float,
+    current_active_per_tok: float,
+    target_k: float,
+    eta: float,
+    lambda_min: float = 1e-6,
+    lambda_max: float = 1.0,
+) -> float:
+    """Bang-bang adaptive λ controller (Eq. 19), expressed in active-experts space.
+
+    Sparsity S = 1 - active/N and target sparsity 1-k/N, so
+        sign((1-k/N) - S) = sign(active/N - k/N) = sign(active - k).
+    When more than k experts are active (too dense), λ increases; when fewer
+    than k are active (too sparse), λ decreases.
+    """
+    if current_active_per_tok > target_k:
+        new_lambda = lambda_val * eta
+    else:
+        new_lambda = lambda_val / eta
+    return float(max(lambda_min, min(lambda_max, new_lambda)))
+
+
+# ============================================================================ #
+#  PoE MoE block                                                                #
+# ============================================================================ #
+
+class PoEMoEBlock(nn.Module):
+    """Plain ReLU routing block whose only addition is the L_div auxiliary loss.
+
+    Forward pass is identical to ReMoE (model.MoEBlock, routing_mode="relu")
+    except that it additionally:
+      • computes the divergence loss L_div from the current routing weights and
+        the running shrunk covariance Σ̂ (a constant), stored in last_div_loss;
+      • registers a backward hook on the layer output y to capture ∂L/∂y;
+      • caches detached expert outputs + indices + routing weights so that
+        update_portfolio_stats() can build the next step's covariance.
+
+    Running statistics (μ̂, Ĉ, Σ̂, noise) are kept as plain fp32 tensors created
+    lazily on the correct device. They are deliberately NOT registered buffers:
+    under FSDP MixedPrecision(buffer_dtype=bf16) buffers would be downcast to
+    bf16, which destroys covariance precision. They are not checkpointed; they
+    re-warm within ~1/β steps after a resume, which is harmless.
+    """
+
+    def __init__(self, cfg: PoEConfig):
+        super().__init__()
+        self.cfg = cfg
+        self.h = cfg.hidden_size
+        self.num_routed = cfg.num_routed_experts  # N
+        self.num_shared = cfg.num_shared_experts
+        self.top_k = cfg.num_experts_per_tok      # k
+        self.inter = cfg.moe_intermediate_size
+        N = self.num_routed
+
+        self.gate = nn.Linear(self.h, N, bias=False)
+        self.routed_experts = nn.ModuleList([
+            SwiGLU(self.h, self.inter) for _ in range(N)
+        ])
+        self.shared_experts = nn.ModuleList([
+            SwiGLU(self.h, self.inter) for _ in range(self.num_shared)
+        ])
+
+        # Risk aversion b (Python float; set identically on all ranks by the loop).
+        self.b: float = 0.0
+
+        # Running statistics (lazily initialised fp32 tensors; see class docstring).
+        self.mu_hat: Optional[torch.Tensor] = None       # [N] running mean return
+        self.C_hat: Optional[torch.Tensor] = None        # [N,N] running covariance
+        self.Sigma_hat: Optional[torch.Tensor] = None    # [N,N] shrunk, zero diag
+        self.cov_noise: Optional[torch.Tensor] = None    # [N,N] noise EMA (ledoit_wolf)
+        self.ret_rms: Optional[torch.Tensor] = None      # [N] running RMS of returns
+        self._stats_steps: int = 0                       # calls to update_portfolio_stats
+
+        # Per-step caches populated in forward(), consumed after backward().
+        # _expert_outs[e] = (E_e [n_e,H] detached, idx [n_e], weights [n_e]).
+        self._expert_outs: Dict[int, Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+        self._dy: Optional[torch.Tensor] = None
+        self._n_tok: int = 0
+
+        # Logging stats (same interface as MoEBlock).
+        self.last_l1_loss: Optional[torch.Tensor] = None
+        self.last_div_loss: Optional[torch.Tensor] = None
+        self.last_active_count: Optional[torch.Tensor] = None
+        self.last_num_tokens: int = 0
+
+    # ── helpers ──────────────────────────────────────────────────────────────
+
+    def reset_stats(self) -> None:
+        self.last_l1_loss = None
+        self.last_div_loss = None
+        self.last_active_count = None
+        self.last_num_tokens = 0
+
+    def set_b(self, b: float) -> None:
+        self.b = float(b)
+
+    def _ensure_stats(self, device: torch.device) -> None:
+        """Lazily allocate running-statistic tensors on the given device."""
+        N = self.num_routed
+        if self.mu_hat is None:
+            self.mu_hat = torch.zeros(N, device=device)
+            self.C_hat = torch.zeros(N, N, device=device)
+            self.Sigma_hat = torch.zeros(N, N, device=device)
+            self.cov_noise = torch.zeros(N, N, device=device)
+            self.ret_rms = torch.ones(N, device=device)
+        elif self.mu_hat.device != device:
+            self.mu_hat = self.mu_hat.to(device)
+            self.C_hat = self.C_hat.to(device)
+            self.Sigma_hat = self.Sigma_hat.to(device)
+            self.cov_noise = self.cov_noise.to(device)
+            self.ret_rms = self.ret_rms.to(device)
+
+    # ── forward (Eq. 14, 15, 16, 18/20) ───────────────────────────────────────
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, T, H = x.shape
+        flat = x.reshape(-1, H)
+        M = flat.shape[0]
+
+        self._expert_outs.clear()
+        self._dy = None
+        self._n_tok = M
+
+        # Plain ReLU routing (Eq. 14): no portfolio machinery here.
+        logits = self.gate(flat)              # [M, N]
+        scores = F.relu(logits)               # [M, N]
+
+        # Run active routed experts (Eq. 15); cache detached outputs for returns.
+        out_routed = torch.zeros_like(flat)
+        for e in range(self.num_routed):
+            active = scores[:, e] > 0
+            if not active.any():
+                continue
+            idx = active.nonzero(as_tuple=True)[0]
+            w = scores[idx, e]                          # [n_e] routing weights
+            expert_out = self.routed_experts[e](flat[idx])  # [n_e, H]
+            if self.training:
+                self._expert_outs[e] = (
+                    expert_out.detach(), idx.detach(), w.detach(),
+                )
+            out_routed.index_add_(0, idx, (expert_out * w.unsqueeze(-1)).to(flat.dtype))
+
+        out_shared = sum(expert(flat) for expert in self.shared_experts)
+        y = out_routed + out_shared           # [M, H]
+
+        # Capture ∂L/∂y for the return signal (Eq. 4). L_div and L_reg do not
+        # depend on y, so the captured gradient is exactly the task gradient.
+        if self.training:
+            def _capture_dy(grad: torch.Tensor) -> None:
+                self._dy = grad.detach()
+            y.register_hook(_capture_dy)
+
+        # Divergence penalty L_div (Eq. 16) using the constant Σ̂ from prior steps.
+        # quad = Σ_m Σ_{i≠j} R_mi R_mj Σ̂_ij  (diagonal of Σ̂ is zero, so i=j drops).
+        if self.b != 0.0 and self.Sigma_hat is not None:
+            Sig = self.Sigma_hat.to(scores.dtype)        # [N,N], zero diagonal
+            quad = (scores @ Sig * scores).sum()         # scalar, grad -> gate W
+            self.last_div_loss = self.b * quad / max(M, 1)
+        else:
+            self.last_div_loss = scores.sum() * 0.0      # graph-connected zero
+
+        # Sparsity / load-balancing regulariser (Eq. 18 / Eq. 20).
+        with torch.no_grad():
+            active_mask = scores > 0                     # [M, N]
+            frac_active = active_mask.float().mean(dim=0)  # [N]
+            if self.cfg.use_load_balancing:
+                # f_i = (N/k) · frac_active_i  (Eq. 20 load factor).
+                load = frac_active * (self.num_routed / max(self.top_k, 1))
+            else:
+                load = torch.ones_like(frac_active)
+            self.last_active_count = active_mask.float().sum(dim=-1).mean().detach()
+            self.last_num_tokens = M
+        self.last_l1_loss = (load.detach() * scores).sum() / max(M, 1)
+
+        return y.view(B, T, H)
+
+    # ── covariance estimators (Section 3 ablation axis) ───────────────────────
+
+    def _build_dense(self, device, dtype):
+        """Build dense [M,N] return / activation / routing-weight matrices.
+
+        Returns (R, A, P) where
+          R[m,i] = r_i(x_m)            (0 where expert i inactive on token m)
+          A[m,i] = 1 if expert i active on token m else 0
+          P[m,i] = routing weight R(x_m)_i   (0 where inactive)
+        """
+        M, N = self._n_tok, self.num_routed
+        R = torch.zeros(M, N, device=device, dtype=dtype)
+        A = torch.zeros(M, N, device=device, dtype=dtype)
+        P = torch.zeros(M, N, device=device, dtype=dtype)
+        dy = self._dy.to(dtype)                          # [M, H]
+        for e, (E_e, idx, w) in self._expert_outs.items():
+            if idx.numel() == 0:
+                continue
+            E_e = E_e.to(device=device, dtype=dtype)
+            r = -(E_e * dy[idx]).sum(dim=-1)             # [n_e] per-token returns
+            R[idx, e] = r
+            A[idx, e] = 1.0
+            P[idx, e] = w.to(dtype)
+        return R, A, P
+
+    def _cov_coactivation(self, R, A, mu):
+        """Eq. 9: c_ij = mean_{m∈A_ij} (r_i-μ_i)(r_j-μ_j), centred deviations."""
+        D = (R - mu.unsqueeze(0)) * A                    # [M,N], zero where inactive
+        num = D.t() @ D                                  # [N,N] sum over co-active m
+        cnt = A.t() @ A                                  # [N,N] = |A_ij|
+        return num, cnt
+
+    def _cov_routing_weighted(self, R, A, P, mu):
+        """Routing-weighted variant: weight the return product by p_i p_j."""
+        Dw = (R - mu.unsqueeze(0)) * P                   # [M,N] weighted deviations
+        PA = P * A
+        num = Dw.t() @ Dw                                # Σ_m (p_i dev_i)(p_j dev_j)
+        cnt = PA.t() @ PA                                # Σ_m p_i p_j (on co-active)
+        return num, cnt
+
+    def _cov_batchmean(self, R, A, mu):
+        """Per-step batch-mean cross-product (between-step confound baseline)."""
+        cnt_i = A.sum(dim=0)                             # [N] |A_i|
+        bsum = R.sum(dim=0)                              # [N] sum of active returns
+        bmean = bsum / cnt_i.clamp(min=1.0)             # [N] batch-mean return
+        dev = (bmean - mu) * (cnt_i > 0).to(R.dtype)     # zero for inactive experts
+        num = dev.unsqueeze(1) * dev.unsqueeze(0)        # [N,N] outer product
+        both = (cnt_i > 0).to(R.dtype)
+        cnt = both.unsqueeze(1) * both.unsqueeze(0)      # 1 where both active
+        return num, cnt
+
+    def _cov_set_overlap(self, A):
+        """Gradient-agnostic Jaccard overlap of co-activation sets."""
+        inter = A.t() @ A                                # |A_i ∩ A_j|
+        ni = A.sum(dim=0)                                # |A_i|
+        union = ni.unsqueeze(1) + ni.unsqueeze(0) - inter
+        jacc = inter / union.clamp(min=1.0)              # in [0,1]
+        cnt = inter                                      # use overlap count as weight
+        return jacc, cnt
+
+    def _cov_output_similarity(self, A, device, dtype):
+        """Gradient-agnostic <E_i,E_j> output similarity (Guo et al.; Remark 2).
+
+        Builds a dense [M,N,H] expert-output tensor (zero where inactive) and
+        sums per-token inner products over co-activated tokens. Memory is bounded
+        by chunking the einsum over the token dimension.
+        """
+        M, N, H = self._n_tok, self.num_routed, self.h
+        E_dense = torch.zeros(M, N, H, device=device, dtype=dtype)
+        for e, (E_e, idx, _w) in self._expert_outs.items():
+            if idx.numel() == 0:
+                continue
+            E_dense[idx, e, :] = E_e.to(device=device, dtype=dtype)
+        num = torch.zeros(N, N, device=device, dtype=dtype)
+        chunk = 4096
+        for s in range(0, M, chunk):
+            Ec = E_dense[s:s + chunk]                    # [c,N,H]
+            num += torch.einsum("mih,mjh->ij", Ec, Ec)
+        cnt = A.t() @ A                                  # |A_ij|
+        return num, cnt
+
+    # ── EMA statistics update (call after loss.backward()) ────────────────────
+
+    @torch.no_grad()
+    def update_portfolio_stats(self) -> None:
+        """Update μ̂, Ĉ and Σ̂ from the most recent backward pass.
+
+        MUST be called AFTER backward (so _dy is populated) and BEFORE the next
+        forward (so Σ̂ is fresh for L_div). Silently skips when the hook did not
+        fire (eval / no active experts).
+        """
+        if self._dy is None or not self._expert_outs:
+            if (self.b != 0.0 and self.training
+                    and self._stats_steps > self.cfg.shrinkage_warmup_steps):
+                warnings.warn(
+                    f"[PoE] update_portfolio_stats skipped with b={self.b}: "
+                    f"dy={'set' if self._dy is not None else 'None'}, "
+                    f"experts_cached={len(self._expert_outs)}. "
+                    f"Sigma_hat is stale — L_div will use outdated covariance.",
+                    stacklevel=2,
+                )
+            self._dy = None
+            return
+
+        device = self._dy.device
+        self._ensure_stats(device)
+        self._stats_steps += 1
+        N = self.num_routed
+        cfg = self.cfg
+        work_dtype = torch.float32
+
+        R, A, P = self._build_dense(device, work_dtype)
+
+        # Optional return scaling for a scale-free covariance (helps fix one b).
+        cnt_i = A.sum(dim=0)                             # [N] |A_i|
+        active_i = cnt_i > 0
+        if cfg.return_scale == "rms":
+            ms = (R * R).sum(dim=0) / cnt_i.clamp(min=1.0)  # mean square per expert
+            a = cfg.return_rms_ema
+            self.ret_rms[active_i] = (
+                (1 - a) * self.ret_rms[active_i] + a * ms[active_i].clamp(min=cfg.eps)
+            )
+            scale = self.ret_rms.sqrt().clamp(min=cfg.eps)
+            R = (R / scale.unsqueeze(0)) * A             # rescale, keep zeros
+
+        # Update running mean μ̂ (centre with prior μ̂; update after building cov).
+        bsum = R.sum(dim=0)
+        bmean = bsum / cnt_i.clamp(min=1.0)
+        mu_prev = self.mu_hat.clone()
+
+        # Per-step raw covariance c and per-pair sample count, by estimator.
+        est = cfg.cov_estimator
+        if est == "coactivation":
+            num, cnt = self._cov_coactivation(R, A, mu_prev)
+        elif est == "routing_weighted":
+            num, cnt = self._cov_routing_weighted(R, A, P, mu_prev)
+        elif est == "batchmean":
+            num, cnt = self._cov_batchmean(R, A, mu_prev)
+        elif est == "set_overlap":
+            c_step, cnt = self._cov_set_overlap(A)
+            num = None  # set_overlap returns the similarity directly
+        elif est == "output_similarity":
+            num, cnt = self._cov_output_similarity(A, device, work_dtype)
+        else:  # pragma: no cover - guarded by config
+            raise ValueError(est)
+
+        if num is not None:
+            c_step = num / cnt.clamp(min=1.0)            # per-step covariance/similarity
+
+        # Zero the diagonal (self terms never enter the penalty).
+        c_step = c_step.clone()
+        c_step.fill_diagonal_(0.0)
+
+        # EMA update Ĉ (Eq. 10), only for pairs with enough samples this step.
+        valid = (cnt >= cfg.min_coact)
+        valid.fill_diagonal_(False)
+        beta = cfg.beta_cov
+        if valid.any():
+            new_C = (1 - beta) * self.C_hat + beta * c_step
+            # Track per-step noise (squared deviation of the new estimate) for
+            # the Ledoit-Wolf intensity, before overwriting Ĉ.
+            if cfg.shrinkage_mode == "ledoit_wolf":
+                dev = (c_step - self.C_hat) ** 2
+                a = cfg.shrinkage_noise_ema
+                upd_noise = (1 - a) * self.cov_noise + a * dev
+                self.cov_noise[valid] = upd_noise[valid]
+            self.C_hat[valid] = new_C[valid]
+
+        # Update μ̂ for active experts (Eq. 9's running mean).
+        if active_i.any():
+            mu_upd = (1 - cfg.mu_ema) * self.mu_hat + cfg.mu_ema * bmean
+            self.mu_hat[active_i] = mu_upd[active_i]
+
+        # Shrinkage Σ̂ = (1-γ) Ĉ (Eq. 13).
+        gamma = self._shrinkage_gamma()
+        Sig = (1.0 - gamma) * self.C_hat
+        # Boundedness fix: clamp negative entries so L_div ≥ 0.
+        # With Σ̂_ij ≥ 0 and s_i ≥ 0, sᵀΣ̂s ≥ 0 — removes the unbounded
+        # downward direction from anti-correlated pairs (see review note 1).
+        if cfg.penalty_sign == "redundancy_only":
+            Sig = Sig.clamp(min=0.0)
+        Sig.fill_diagonal_(0.0)
+        self.Sigma_hat = Sig
+
+        self._dy = None
+        self._expert_outs.clear()
+
+    def _shrinkage_gamma(self) -> float:
+        """Compute the shrinkage intensity γ for the current step (Eq. 13)."""
+        cfg = self.cfg
+        if cfg.shrinkage_mode == "none":
+            return 0.0
+        if cfg.shrinkage_mode == "constant":
+            return float(cfg.shrinkage_gamma)
+        if cfg.shrinkage_mode == "schedule":
+            # Cold start: γ = 1 early (Σ̂ = 0 -> ReLU baseline, Prop. 4), decays.
+            t = self._stats_steps
+            W = max(cfg.shrinkage_warmup_steps, 1)
+            frac = min(1.0, t / W)
+            return float(max(cfg.shrinkage_gamma_min, 1.0 - frac))
+        # ledoit_wolf: γ = noise / (noise + signal) over off-diagonal entries.
+        N = self.num_routed
+        off = ~torch.eye(N, dtype=torch.bool, device=self.C_hat.device)
+        noise = self.cov_noise[off].sum()
+        signal = (self.C_hat[off] ** 2).sum()
+        gamma = (noise / (noise + signal + cfg.eps)).item()
+        return float(min(cfg.shrinkage_gamma_max, max(cfg.shrinkage_gamma_min, gamma)))
+
+
+# ============================================================================ #
+#  Decoder layer & model                                                        #
+# ============================================================================ #
+
+class PoEDecoderLayer(nn.Module):
+    def __init__(self, cfg: PoEConfig):
+        super().__init__()
+        self.input_layernorm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps)
+        self.self_attn = Attention(cfg)
+        self.post_attention_layernorm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps)
+        self.moe = PoEMoEBlock(cfg)
+
+    def forward(self, x: torch.Tensor, position_ids: torch.Tensor) -> torch.Tensor:
+        x = x + self.self_attn(self.input_layernorm(x), position_ids)
+        x = x + self.moe(self.post_attention_layernorm(x))
+        return x
+
+
+class PoEForCausalLM(nn.Module):
+    """Causal LM with PoE_4 routing, FSDP-compatible (parallel to MoEForCausalLM)."""
+
+    def __init__(self, cfg: PoEConfig):
+        super().__init__()
+        self.config = cfg
+        self.embed_tokens = nn.Embedding(cfg.vocab_size, cfg.hidden_size)
+        self.layers = nn.ModuleList(
+            [PoEDecoderLayer(cfg) for _ in range(cfg.num_hidden_layers)]
+        )
+        self.norm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps)
+        self.lm_head = nn.Linear(cfg.hidden_size, cfg.vocab_size, bias=False)
+
+        self.apply(self._init_weights)
+        if cfg.tie_word_embeddings:
+            self.lm_head.weight = self.embed_tokens.weight
+
+    def _init_weights(self, m: nn.Module) -> None:
+        std = self.config.initializer_range
+        if isinstance(m, nn.Linear):
+            nn.init.normal_(m.weight, mean=0.0, std=std)
+        elif isinstance(m, nn.Embedding):
+            nn.init.normal_(m.weight, mean=0.0, std=std)
+
+    # ── PoE control surface for the training loop ─────────────────────────────
+
+    def set_b(self, b: float) -> None:
+        """Set risk aversion b on all PoE layers (b=0 -> ReLU baseline)."""
+        for layer in self.layers:
+            layer.moe.set_b(b)
+
+    def reset_poe_stats(self) -> None:
+        for layer in self.layers:
+            layer.moe.reset_stats()
+
+    def update_portfolio_stats(self) -> None:
+        for layer in self.layers:
+            layer.moe.update_portfolio_stats()
+
+    def collect_poe_stats(
+        self,
+    ) -> Tuple[List[torch.Tensor], List[torch.Tensor], List[torch.Tensor]]:
+        """Return per-layer (l1_losses, div_losses, active_counts) for the loop."""
+        l1, div, active = [], [], []
+        for layer in self.layers:
+            moe = layer.moe
+            if moe.last_l1_loss is not None:
+                l1.append(moe.last_l1_loss)
+            if moe.last_div_loss is not None:
+                div.append(moe.last_div_loss)
+            if moe.last_active_count is not None:
+                active.append(moe.last_active_count)
+        return l1, div, active
+
+    def avg_shrinkage_gamma(self) -> float:
+        """Mean current shrinkage intensity across layers (for cold-start logging)."""
+        gs = [layer.moe._shrinkage_gamma() for layer in self.layers
+              if layer.moe.C_hat is not None]
+        return float(sum(gs) / len(gs)) if gs else 1.0
+
+    @torch.no_grad()
+    def sync_portfolio_stats(self) -> None:
+        """All-reduce running stats (μ̂, Ĉ, noise, ret_rms) across FSDP ranks.
+
+        Call periodically (e.g. every log_interval steps) to prevent rank
+        divergence of the covariance estimate under data-parallel training.
+        Requires torch.distributed to be initialised.
+        """
+        import torch.distributed as dist
+        if not dist.is_initialized():
+            return
+        for layer in self.layers:
+            moe = layer.moe
+            for buf in [moe.C_hat, moe.mu_hat, moe.cov_noise, moe.ret_rms]:
+                if buf is not None:
+                    dist.all_reduce(buf, op=dist.ReduceOp.AVG)
+
+    @torch.no_grad()
+    def collect_diagnostic_stats(self) -> Dict[str, float]:
+        """Collect per-layer portfolio diagnostics for WandB logging.
+
+        Returns a flat dict with keys like 'poe_diag/layer_03/sigma_frob'.
+        Cheap to compute — all quantities are already materialised.
+        """
+        out: Dict[str, float] = {}
+        for i, layer in enumerate(self.layers):
+            moe = layer.moe
+            tag = f"poe_diag/layer_{i:02d}"
+            if moe.Sigma_hat is not None:
+                S = moe.Sigma_hat
+                out[f"{tag}/sigma_frob"] = float(S.norm())
+                off = S[~torch.eye(S.shape[0], dtype=torch.bool, device=S.device)]
+                out[f"{tag}/sigma_off_mean"] = float(off.mean()) if off.numel() > 0 else 0.0
+                out[f"{tag}/sigma_off_max"]  = float(off.abs().max()) if off.numel() > 0 else 0.0
+            if moe.C_hat is not None:
+                out[f"{tag}/chat_frob"] = float(moe.C_hat.norm())
+            out[f"{tag}/gamma"] = moe._shrinkage_gamma()
+            if moe.last_div_loss is not None:
+                out[f"{tag}/div_loss"] = float(moe.last_div_loss.detach())
+            if moe.last_active_count is not None:
+                out[f"{tag}/active_per_tok"] = float(moe.last_active_count.detach())
+        return out
+
+    # ── forward ───────────────────────────────────────────────────────────────
+
+    def forward(self, input_ids, labels=None, **kwargs) -> MoEModelOutput:
+        B, T = input_ids.shape
+        x = self.embed_tokens(input_ids)
+        position_ids = torch.arange(T, device=input_ids.device).unsqueeze(0).expand(B, -1)
+
+        for layer in self.layers:
+            x = layer(x, position_ids)
+        x = self.norm(x)
+        logits = self.lm_head(x)
+
+        loss = None
+        if labels is not None:
+            shift_logits = logits[..., :-1, :].contiguous().float()
+            shift_labels = labels[..., 1:].contiguous()
+            loss = F.cross_entropy(
+                shift_logits.view(-1, shift_logits.size(-1)),
+                shift_labels.view(-1),
+                ignore_index=-100,
+            )
+        # L1 (Eq. 18/20) and L_div (Eq. 16) are added by the training loop from
+        # collect_poe_stats(); they are not folded into loss here.
+        return MoEModelOutput(loss=loss, logits=logits, aux_loss=None, z_loss=None)
+
+
+# ============================================================================ #
+#  Utility                                                                      #
+# ============================================================================ #
+
+def count_active_params_poe(cfg: PoEConfig) -> int:
+    """Per-token activated params (excl. embed/lm_head); mirrors model.count_active_params."""
+    h, d, inter = cfg.hidden_size, cfg.head_dim, cfg.moe_intermediate_size
+    attn = (
+        h * cfg.num_attention_heads * d
+        + h * cfg.num_key_value_heads * d * 2
+        + cfg.num_attention_heads * d * h
+    )
+    expert_params = 3 * h * inter
+    moe_active = (cfg.num_experts_per_tok + cfg.num_shared_experts) * expert_params
+    router = h * cfg.num_routed_experts
+    norm = 2 * h
+    return (attn + moe_active + router + norm) * cfg.num_hidden_layers
