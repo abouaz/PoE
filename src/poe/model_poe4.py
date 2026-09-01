@@ -4,7 +4,6 @@
 Portfolio of Experts (PoE) — PoE_4 framework.
 
 This file implements the framework described in "Portfolio of Experts"
-(Yin, Deng, Bouaziz, Wang — UCL Centre for Artificial Intelligence, PoE_4.pdf).
 
 KEY DIFFERENCE FROM THE EARLIER DESIGN (model_poe.py / model_poe_overused.py)
 ----------------------------------------------------------------------------
